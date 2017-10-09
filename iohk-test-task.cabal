@@ -32,6 +32,7 @@ executable iohktt
                     , network-transport
                     , optparse-applicative
                     , tf-random
+                    , time
                     , vector
                     , yaml
   ghc-options:        -O2 -Wall -threaded -rtsopts -O2 -with-rtsopts=-N

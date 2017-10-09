@@ -1,20 +1,28 @@
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TemplateHaskell   #-}
+{-# LANGUAGE DeriveGeneric        #-}
+{-# LANGUAGE LambdaCase           #-}
+{-# LANGUAGE OverloadedStrings    #-}
+{-# LANGUAGE RecordWildCards      #-}
+{-# LANGUAGE TemplateHaskell      #-}
+{-# LANGUAGE TypeApplications     #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module Main (main) where
 
+import Control.Concurrent (threadDelay)
 import Control.Distributed.Process
 import Control.Distributed.Process.Backend.SimpleLocalnet
 import Control.Distributed.Process.Closure
 import Control.Distributed.Process.Node (initRemoteTable)
-import Control.Lens (makeLenses, (^.))
+import Control.Lens hiding (argument)
 import Control.Monad
 import Data.Aeson hiding (Options)
 import Data.Binary
 import Data.Char (toLower)
+import Data.Function (fix)
 import Data.List (intersect)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Monoid
+import Data.Time
 import Data.Typeable
 import Data.Yaml hiding (Parser)
 import GHC.Generics (Generic)
@@ -57,19 +65,104 @@ instance FromJSON NodeList where
   parseJSON v = NodeList . fmap (NodeId . EndPointAddress . B8.pack)
     <$> parseJSON v
 
+data SlaveState = SlaveState
+  { _sstPeers :: [ProcessId]
+    -- ^ A list of peer processes to which to send the messages
+  , _sstGracePeriodStart :: UTCTime
+    -- ^ Absolute time up to which to send the messages
+  , _sstReceived :: [Double]
+    -- ^ Numbers received so far
+  } deriving (Typeable, Generic)
+
+-- NOTE An orphan instance, could be avoided with a newtype, but for the
+-- purposes of this task it doesn't make any difference, it's not a library.
+
+instance Binary UTCTime where
+  put UTCTime {..} = do
+    put (toModifiedJulianDay utctDay)
+    put (diffTimeToPicoseconds utctDayTime)
+  get = do
+    utctDay     <- ModifiedJulianDay     <$> get
+    utctDayTime <- picosecondsToDiffTime <$> get
+    return UTCTime {..}
+
+instance Binary SlaveState
+
+data InitializingMsg = InitializingMsg SlaveState
+  deriving (Typeable, Generic)
+
+instance Binary InitializingMsg
+
+data NumberMsg = NumberMsg Double
+  deriving (Typeable, Generic)
+
+instance Binary NumberMsg
+
+makeLenses 'SlaveState
+
 ----------------------------------------------------------------------------
 -- Slave logic
 
-slave :: Process ()
-slave = return ()
+slave :: Maybe SlaveState -> Process ()
+slave = \case
+  Nothing -> do
+    -- We haven't received the state yet (have to send it separately because
+    -- we don't know the full list of process ids of peers when we spawn
+    -- slave processes). In that case we wait for an initializing message.
+    InitializingMsg st <- expect
+    slave (Just st)
+  Just st -> do
+    -- Message receiving.
+    ctime <- liftIO getCurrentTime
+    if ctime >= st ^. sstGracePeriodStart
+      then do
+        let l = st ^. sstReceived
+            s = getSum . mconcat $ zipWith
+              (\i mi -> Sum (i * mi))
+              [1..]
+              (reverse l)
+            m = length l
+        pid <- getSelfPid
+        say $ "Process " ++ show pid ++ " finished with results: |m|="
+          ++ show m ++ ", sigma=" ++ show s
+      else do
+        NumberMsg x <- expect
+        slave . Just $ st & sstReceived %~ (x:)
+
+-- TODO 1) These thingies should also send the messages…
 
 remotable ['slave]
 
 ----------------------------------------------------------------------------
 -- Master logic
 
-master :: [NodeId] -> Process ()
-master _ = return ()
+master :: Backend -> Natural -> Natural -> [NodeId] -> Process ()
+master backend sendFor waitFor nids = do
+  say "Spawning slave processes"
+  pids <- forM nids $ \nid ->
+    spawn nid ($(mkClosure 'slave) (Nothing :: Maybe SlaveState))
+  say "Sending initializing messages"
+  ctime <- liftIO getCurrentTime
+  let gracePeriodStart = addUTCTime (fromIntegral sendFor) ctime
+      gradePeriodEnd   = addUTCTime (fromIntegral (sendFor + waitFor)) ctime
+      mkSlaveStateFor pid = SlaveState
+        { _sstPeers            = filter (/= pid) pids
+        , _sstGracePeriodStart = gracePeriodStart
+        , _sstReceived         = [] }
+  forM_ pids $ \pid ->
+    send pid (mkSlaveStateFor pid)
+  -- TODO 2) Also restart died processes here.
+  say "Waiting for the end of grace period"
+  waitTill gradePeriodEnd
+  say "Time is up, killing all slaves"
+  terminateAllSlaves backend
+
+waitTill :: UTCTime -> Process ()
+waitTill t = fix $ \continue -> do
+  ctime <- liftIO getCurrentTime
+  when (ctime < t) $ do
+    liftIO (threadDelay 500000)
+    continue
 
 ----------------------------------------------------------------------------
 -- Main and parser
@@ -93,7 +186,8 @@ main = do
             -- NOTE This is in assumption that node lists you mention are
             -- used to select a subset of all automatically discovered
             -- nodes.
-            master $ NE.toList nodeList `intersect` allNodes
+            master backend sendFor waitFor
+              (NE.toList nodeList `intersect` allNodes)
 
 parserInfo :: ParserInfo Options
 parserInfo = info (helper <*> optionParser)
