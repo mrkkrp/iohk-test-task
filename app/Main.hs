@@ -17,8 +17,8 @@ import Control.Lens hiding (argument)
 import Control.Monad
 import Data.Aeson hiding (Options)
 import Data.Binary
-import Data.Char (toLower)
 import Data.Function (fix)
+import Data.IORef
 import Data.List (intersect)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Monoid
@@ -30,14 +30,13 @@ import Network.Socket (HostName, ServiceName)
 import Network.Transport (EndPointAddress (..))
 import Numeric.Natural
 import Options.Applicative
-import System.Environment (getArgs)
 import System.Exit (exitWith, ExitCode (..))
 import System.IO (hPutStrLn, stderr)
-import System.Random.TF
 import Text.Read (readMaybe)
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.List.NonEmpty    as NE
-import qualified Data.Vector           as V
+import qualified System.Random.TF      as TF
+import qualified System.Random.TF.Gen  as TF
 
 ----------------------------------------------------------------------------
 -- Data types
@@ -72,9 +71,10 @@ data SlaveState = SlaveState
     -- ^ Absolute time up to which to send the messages
   , _sstReceived :: [Double]
     -- ^ Numbers received so far
+  , _sstTFGen :: TF.TFGen
   } deriving (Typeable, Generic)
 
--- NOTE An orphan instance, could be avoided with a newtype, but for the
+-- NOTE Orphan instances, could be avoided with a newtypes, but for the
 -- purposes of this task it doesn't make any difference, it's not a library.
 
 instance Binary UTCTime where
@@ -85,6 +85,10 @@ instance Binary UTCTime where
     utctDay     <- ModifiedJulianDay     <$> get
     utctDayTime <- picosecondsToDiffTime <$> get
     return UTCTime {..}
+
+instance Binary TF.TFGen where -- TODO Ouch! This is really not nice.
+  put = put . show
+  get = read <$> get
 
 instance Binary SlaveState
 
@@ -118,13 +122,11 @@ slave = \case
     slave (Just st)
   Just st -> do
     ctime <- liftIO getCurrentTime
-    mfinished <- receiveTimeout 0 -- Just check for incoming messages without blocking.
+    mfinished <- receiveTimeout 0 -- Just check for incoming messages
+                                  -- without blocking.
       [ match $ \FinishNow -> do
           let l = st ^. sstReceived
-              s = getSum . mconcat $ zipWith
-                (\i mi -> Sum (i * mi))
-                [1..]
-                (reverse l)
+              s = sum $ zipWith (*) [1..] (reverse l)
               m = length l
           nid <- getSelfNode
           pid <- getSelfPid
@@ -136,16 +138,21 @@ slave = \case
           slave . Just $ st & sstReceived %~ (x:)
           return False ]
     case mfinished of
-      Nothing -> do
+      Nothing ->
         -- No messages, we could as well send something unless the grace
         -- period has started. By checking against the pre-calculated start
         -- of the grace period we can ensure that once GP starts literally
         -- no message will be sent.
-        when (ctime < st ^. sstGracePeriodStart) $
-          forM_ (st ^. sstPeers) $ \pid -> do
-            let x = 0.5 -- TODO Normal random generation here.
-            send pid (NumberMsg x)
-        slave (Just st)
+        if ctime < st ^. sstGracePeriodStart
+          then do
+            let f gen pid = do
+                  let (w32, gen') = TF.next gen
+                      x = fromIntegral (w32 + 1) / 0x100000000
+                  send pid (NumberMsg x)
+                  return gen'
+            newGen <- foldM f (st ^. sstTFGen) (st ^. sstPeers)
+            slave . Just $ st & sstTFGen .~ newGen
+          else slave (Just st)
       Just False ->
         slave (Just st)
       Just True ->
@@ -156,22 +163,33 @@ remotable ['slave]
 ----------------------------------------------------------------------------
 -- Master logic
 
-master :: Backend -> Natural -> Natural -> [NodeId] -> Process ()
-master backend sendFor waitFor nids = do
+master
+  :: Backend           -- ^ Backend thing, so we can kill all slaves
+  -> Natural           -- ^ For how many seconds to send the messages
+  -> Natural           -- ^ Grace period duration
+  -> TF.TFGen          -- ^ Seed for random number generator
+  -> [NodeId]          -- ^ List of all detected nodes
+  -> Process ()
+master backend sendFor waitFor seed nids = do
   say "Spawning slave processes"
   say (show nids)
   pids <- forM nids $ \nid ->
     spawn nid ($(mkClosure 'slave) (Nothing :: Maybe SlaveState))
   say "Sending initializing messages"
   ctime <- liftIO getCurrentTime
+  tfgen <- liftIO (newIORef seed)
   let gracePeriodStart = addUTCTime (fromIntegral sendFor) ctime
       gracePeriodEnd   = addUTCTime (fromIntegral (sendFor + waitFor)) ctime
-      mkSlaveStateFor pid = SlaveState
-        { _sstPeers            = filter (/= pid) pids
-        , _sstGracePeriodStart = gracePeriodStart
-        , _sstReceived         = [] }
+      mkSlaveStateFor pid = do
+        (gen0,gen1) <- TF.split <$> liftIO (readIORef tfgen)
+        liftIO (writeIORef tfgen gen0)
+        return SlaveState
+          { _sstPeers            = filter (/= pid) pids
+          , _sstGracePeriodStart = gracePeriodStart
+          , _sstReceived         = []
+          , _sstTFGen            = gen1 }
   forM_ pids $ \pid ->
-    send pid (InitializingMsg $ mkSlaveStateFor pid)
+    mkSlaveStateFor pid >>= send pid . InitializingMsg
   -- TODO Also restart died processes here.
   say "Waiting for start of the grace period"
   waitTill gracePeriodStart
@@ -182,6 +200,9 @@ master backend sendFor waitFor nids = do
   say "Waiting for end of the grace period"
   waitTill gracePeriodEnd
   say "Time is up, killing all slaves"
+  -- Not really necessary but the document says “If result isn't printed
+  -- till now, program is killed”. It's not clear whether slave nodes should
+  -- be killed or just master…
   terminateAllSlaves backend
 
 waitTill :: UTCTime -> Process ()
@@ -213,7 +234,7 @@ main = do
             -- NOTE This is in assumption that node lists you mention are
             -- used to select a subset of all automatically discovered
             -- nodes.
-            master backend sendFor waitFor
+            master backend sendFor waitFor (TF.mkTFGen $ fromIntegral seed)
               (NE.toList nodeList `intersect` allNodes)
 
 parserInfo :: ParserInfo Options
