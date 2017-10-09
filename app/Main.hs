@@ -98,6 +98,11 @@ data NumberMsg = NumberMsg Double
 
 instance Binary NumberMsg
 
+data FinishNow = FinishNow
+  deriving (Typeable, Generic)
+
+instance Binary FinishNow
+
 makeLenses 'SlaveState
 
 ----------------------------------------------------------------------------
@@ -112,24 +117,39 @@ slave = \case
     InitializingMsg st <- expect
     slave (Just st)
   Just st -> do
-    -- Message receiving.
     ctime <- liftIO getCurrentTime
-    if ctime >= st ^. sstGracePeriodStart
-      then do
-        let l = st ^. sstReceived
-            s = getSum . mconcat $ zipWith
-              (\i mi -> Sum (i * mi))
-              [1..]
-              (reverse l)
-            m = length l
-        pid <- getSelfPid
-        say $ "Process " ++ show pid ++ " finished with results: |m|="
-          ++ show m ++ ", sigma=" ++ show s
-      else do
-        NumberMsg x <- expect
-        slave . Just $ st & sstReceived %~ (x:)
-
--- TODO 1) These thingies should also send the messages…
+    mfinished <- receiveTimeout 0 -- Just check for incoming messages without blocking.
+      [ match $ \FinishNow -> do
+          let l = st ^. sstReceived
+              s = getSum . mconcat $ zipWith
+                (\i mi -> Sum (i * mi))
+                [1..]
+                (reverse l)
+              m = length l
+          nid <- getSelfNode
+          pid <- getSelfPid
+          say $ "Process " ++ show pid ++ " on node " ++ show nid
+            ++ " finished with results: |m|="
+            ++ show m ++ ", sigma=" ++ show s
+          return True
+      , match $ \(NumberMsg x) -> do
+          slave . Just $ st & sstReceived %~ (x:)
+          return False ]
+    case mfinished of
+      Nothing -> do
+        -- No messages, we could as well send something unless the grace
+        -- period has started. By checking against the pre-calculated start
+        -- of the grace period we can ensure that once GP starts literally
+        -- no message will be sent.
+        when (ctime < st ^. sstGracePeriodStart) $
+          forM_ (st ^. sstPeers) $ \pid -> do
+            let x = 0.5 -- TODO Normal random generation here.
+            send pid (NumberMsg x)
+        slave (Just st)
+      Just False ->
+        slave (Just st)
+      Just True ->
+        return ()
 
 remotable ['slave]
 
@@ -139,21 +159,28 @@ remotable ['slave]
 master :: Backend -> Natural -> Natural -> [NodeId] -> Process ()
 master backend sendFor waitFor nids = do
   say "Spawning slave processes"
+  say (show nids)
   pids <- forM nids $ \nid ->
     spawn nid ($(mkClosure 'slave) (Nothing :: Maybe SlaveState))
   say "Sending initializing messages"
   ctime <- liftIO getCurrentTime
   let gracePeriodStart = addUTCTime (fromIntegral sendFor) ctime
-      gradePeriodEnd   = addUTCTime (fromIntegral (sendFor + waitFor)) ctime
+      gracePeriodEnd   = addUTCTime (fromIntegral (sendFor + waitFor)) ctime
       mkSlaveStateFor pid = SlaveState
         { _sstPeers            = filter (/= pid) pids
         , _sstGracePeriodStart = gracePeriodStart
         , _sstReceived         = [] }
   forM_ pids $ \pid ->
-    send pid (mkSlaveStateFor pid)
-  -- TODO 2) Also restart died processes here.
-  say "Waiting for the end of grace period"
-  waitTill gradePeriodEnd
+    send pid (InitializingMsg $ mkSlaveStateFor pid)
+  -- TODO Also restart died processes here.
+  say "Waiting for start of the grace period"
+  waitTill gracePeriodStart
+  -- Need to send this special message now that we know when we have
+  -- processed all messages and do not need to wait for more.
+  forM_ pids $ \pid ->
+    send pid FinishNow
+  say "Waiting for end of the grace period"
+  waitTill gracePeriodEnd
   say "Time is up, killing all slaves"
   terminateAllSlaves backend
 
@@ -199,13 +226,13 @@ optionParser :: Parser Options
 optionParser = subparser
   (  command "slave"
      (info (helper <*> (Slave
-       <$> argument auto (metavar "HOST" <> help "Host name")
-       <*> argument auto (metavar "SERVICE" <> help "Service name")))
+       <$> argument str (metavar "HOST" <> help "Host name")
+       <*> argument str (metavar "SERVICE" <> help "Service name")))
      (progDesc "Run a slave process"))
   <> command "master"
      (info (helper <*> (Master
-       <$> argument auto (metavar "HOST" <> help "Host name")
-       <*> argument auto (metavar "SERVICE" <> help "Service name"))
+       <$> argument str (metavar "HOST" <> help "Host name")
+       <*> argument str (metavar "SERVICE" <> help "Service name"))
        <*> strOption
        ( long "node-list"
        <> short 'n'
