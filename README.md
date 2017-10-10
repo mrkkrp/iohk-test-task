@@ -105,8 +105,6 @@ they are what described in the document containing the task.
 
 ## Additional comments and clarifications
 
-### Determinism
-
 There are quite a few comments in the source code. In addition to those I'd
 like to add a note about determinism of the program. It looks like
 `distributed-process` in its current state does not allow to write fully
@@ -169,27 +167,6 @@ Time is up, killing all slaves
 It looks like the work is divided fairly but the results are not identical
 between the runs. Perhaps there are some additional implicit requirements I
 should account for, so the seed parameter starts to make sense?
-
-### Failure recovery and speed of communication
-
-The solution has a simple failure recovery mechanism that restarts processes
-on the same node if they die. I have tested this and it works as expected
-except for the fact that in most cases when a process is restarted it's too
-late and the message updating its PID on other nodes comes *after* the
-accumulated heap of messages to process and thus it arrives after start of
-grace period when it cannot make any difference. See my comment in the
-source code.
-
-Accumulation of unprocessed messages happens because we send messages as
-fast as possible, which is a good strategy if we remember this line from the
-task:
-
-> The larger your score with a given sequence of random numbers is, the
-> better.
-
-If “given sequence of random numbers” is determined fully by the seed (and
-that's the case), then to get larger score it's natural to try to consume as
-many random numbers as possible before the grace period starts.
 
 ## License
 

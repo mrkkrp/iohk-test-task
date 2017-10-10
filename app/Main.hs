@@ -42,6 +42,8 @@ import qualified Data.Set              as E
 import qualified System.Random.TF      as TF
 import qualified System.Random.TF.Gen  as TF
 
+-- import System.Random
+
 ----------------------------------------------------------------------------
 -- Data types
 
@@ -151,6 +153,11 @@ slave = \case
     slave (Just st)
   Just st -> do
     ctime <- liftIO getCurrentTime
+
+    -- n <- liftIO (randomIO :: IO Word32)
+    -- when (n >= 0xfffff000) $
+    --   error "Ooops!" -- test a process failure scenario
+
     mfinished <- receiveTimeout 0 -- Just check for incoming messages
                                   -- without blocking.
       [ match $ \FinishNow -> do
@@ -167,13 +174,6 @@ slave = \case
             ++ " finished with results: |m|="
             ++ show m ++ ", sigma=" ++ show s
           return SlaveFinished
-        -- NOTE This RestartedPeerMsg thing does not quite work because it
-        -- arrives mostly after start of grace period when we process the
-        -- accumulated messages sent before start of grace period and then
-        -- it can't make any difference. So died node typically finishes
-        -- with |m|=0 in my tests. This could be avoided I guess if time
-        -- between message were longer and they did not accumulate in such
-        -- quantities before RestartedPeerMsg in the message queue.
       , match $ \(RestartedPeerMsg old new) ->
           return . SlaveContinue $ st & sstPeers %~ E.insert new . E.delete old
       , match $ \numberMsg ->
@@ -245,7 +245,7 @@ master backend sendFor waitFor seed nids = do
     mr <- expectTimeout 0
     case mr of
       Nothing ->
-        when (t < gracePeriodEnd) $ do
+        when (t < gracePeriodStart) $ do
           liftIO (threadDelay 100000)
           continue
       Just (ProcessMonitorNotification monitorRef pid death) -> do
@@ -343,7 +343,7 @@ optionParser = subparser
        <*> option parseNatural
        ( long "wait-for"
        <> short 'l'
-       <> value 30
+       <> value 10
        <> metavar "L"
        <> showDefault
        <> help "Duration (in seconds) of the grace period" )
