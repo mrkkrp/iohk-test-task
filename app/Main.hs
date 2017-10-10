@@ -273,14 +273,14 @@ optionParser = subparser
        <*> option parseNatural
        ( long "send-for"
        <> short 'k'
-       <> value 10
+       <> value 30
        <> metavar "K"
        <> showDefault
        <> help "For how many seconds the system should send messages" )
        <*> option parseNatural
        ( long "wait-for"
        <> short 'l'
-       <> value 5
+       <> value 10
        <> metavar "L"
        <> showDefault
        <> help "Duration (in seconds) of the grace period" )
