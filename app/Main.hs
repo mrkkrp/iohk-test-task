@@ -189,6 +189,8 @@ slave = \case
           then do
             let f gen pid = do
                   let (w32, gen') = TF.next gen
+                      -- This (0,1] interval suggests floating point
+                      -- numbers, I guess.
                       x = fromIntegral (w32 + 1) / 0x100000000
                   send pid (NumberMsg ctime x)
                   return gen'
