@@ -19,9 +19,10 @@ import Data.Aeson hiding (Options)
 import Data.Binary
 import Data.Function (fix)
 import Data.IORef
-import Data.List (intersect)
+import Data.List (intersect, sortBy)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Monoid
+import Data.Ord (comparing)
 import Data.Time
 import Data.Typeable
 import Data.Yaml hiding (Parser)
@@ -58,7 +59,7 @@ data Options
 
 -- | List of slave nodes to use.
 
-data NodeList = NodeList (NonEmpty NodeId)
+newtype NodeList = NodeList (NonEmpty NodeId)
 
 instance FromJSON NodeList where
   parseJSON v = NodeList . fmap (NodeId . EndPointAddress . B8.pack)
@@ -69,7 +70,7 @@ data SlaveState = SlaveState
     -- ^ A list of peer processes to which to send the messages
   , _sstGracePeriodStart :: UTCTime
     -- ^ Absolute time up to which to send the messages
-  , _sstReceived :: [Double]
+  , _sstReceived :: [NumberMsg]
     -- ^ Numbers received so far
   , _sstTFGen :: TF.TFGen
   } deriving (Typeable, Generic)
@@ -92,13 +93,15 @@ instance Binary TF.TFGen where -- TODO Ouch! This is really not nice.
 
 instance Binary SlaveState
 
-data InitializingMsg = InitializingMsg SlaveState
+newtype InitializingMsg = InitializingMsg SlaveState
   deriving (Typeable, Generic)
 
 instance Binary InitializingMsg
 
-data NumberMsg = NumberMsg Double
-  deriving (Typeable, Generic)
+data NumberMsg = NumberMsg
+  { _numberMsgTimestamp :: UTCTime
+  , _numberMsgValue :: Double
+  } deriving (Eq, Show, Typeable, Generic)
 
 instance Binary NumberMsg
 
@@ -108,6 +111,7 @@ data FinishNow = FinishNow
 instance Binary FinishNow
 
 makeLenses 'SlaveState
+makeLenses 'NumberMsg
 
 ----------------------------------------------------------------------------
 -- Slave logic
@@ -115,9 +119,10 @@ makeLenses 'SlaveState
 slave :: Maybe SlaveState -> Process ()
 slave = \case
   Nothing -> do
-    -- We haven't received the state yet (have to send it separately because
-    -- we don't know the full list of process ids of peers when we spawn
-    -- slave processes). In that case we wait for an initializing message.
+    -- NOTE We haven't received the state yet (have to send it separately
+    -- because we don't know the full list of process ids of peers when we
+    -- spawn slave processes). In that case we wait for an initializing
+    -- message.
     InitializingMsg st <- expect
     slave (Just st)
   Just st -> do
@@ -125,8 +130,12 @@ slave = \case
     mfinished <- receiveTimeout 0 -- Just check for incoming messages
                                   -- without blocking.
       [ match $ \FinishNow -> do
-          let l = st ^. sstReceived
-              s = sum $ zipWith (*) [1..] (reverse l)
+          -- NOTE This could be optimized but it looks like performance of
+          -- this bit is not of much interest in this particular task.
+          let l = sortBy
+                    (comparing (view numberMsgTimestamp))
+                    (st ^. sstReceived)
+              s = sum $ zipWith (*) [1..] (view numberMsgValue <$> l)
               m = length l
           nid <- getSelfNode
           pid <- getSelfPid
@@ -134,12 +143,12 @@ slave = \case
             ++ " finished with results: |m|="
             ++ show m ++ ", sigma=" ++ show s
           return True
-      , match $ \(NumberMsg x) -> do
-          slave . Just $ st & sstReceived %~ (x:)
+      , match $ \numberMsg -> do
+          slave . Just $ st & sstReceived %~ (numberMsg:)
           return False ]
     case mfinished of
       Nothing ->
-        -- No messages, we could as well send something unless the grace
+        -- No messages, we can as well send something unless the grace
         -- period has started. By checking against the pre-calculated start
         -- of the grace period we can ensure that once GP starts literally
         -- no message will be sent.
@@ -148,7 +157,7 @@ slave = \case
             let f gen pid = do
                   let (w32, gen') = TF.next gen
                       x = fromIntegral (w32 + 1) / 0x100000000
-                  send pid (NumberMsg x)
+                  send pid (NumberMsg ctime x)
                   return gen'
             newGen <- foldM f (st ^. sstTFGen) (st ^. sstPeers)
             slave . Just $ st & sstTFGen .~ newGen
