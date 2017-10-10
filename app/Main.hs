@@ -71,8 +71,20 @@ data SlaveState = SlaveState
   , _sstGracePeriodStart :: UTCTime
     -- ^ Absolute time up to which to send the messages
   , _sstReceived :: [NumberMsg]
-    -- ^ Numbers received so far
+    -- ^ Numbers received so far. The document does not mention for how long
+    -- sending of messages will happen (seconds, minutes, hours?). If we're
+    -- to run the program for long enough time period, linked list is not a
+    -- very good choice, but then vector is not much better (if we speak of
+    -- hours). Ideally, we would like to avoid accumulating the messages at
+    -- all and adjust some running result as we receive values, but this
+    -- approach seems challenging because there is no guarantee that the
+    -- messages will come in the right order. A message α sent later than
+    -- another message β from other node could arrive earlier than β and
+    -- since we need indices of the messages to calculate the final result,
+    -- we can't know if we won't receive some earlier message at any point
+    -- in time.
   , _sstTFGen :: TF.TFGen
+    -- ^ Random generator state
   } deriving (Typeable, Generic)
 
 -- NOTE Orphan instances, could be avoided with a newtypes, but for the
@@ -202,8 +214,8 @@ master backend sendFor waitFor seed nids = do
   -- TODO Also restart died processes here.
   say "Waiting for start of the grace period"
   waitTill gracePeriodStart
-  -- Need to send this special message now that we know when we have
-  -- processed all messages and do not need to wait for more.
+  -- Need to send this special message now so we know when we have processed
+  -- all messages and do not need to wait for more.
   forM_ pids $ \pid ->
     send pid FinishNow
   say "Waiting for end of the grace period"
@@ -211,7 +223,7 @@ master backend sendFor waitFor seed nids = do
   say "Time is up, killing all slaves"
   -- Not really necessary but the document says “If result isn't printed
   -- till now, program is killed”. It's not clear whether slave nodes should
-  -- be killed or just master…
+  -- be killed or just master, but let's kill'em all.
   terminateAllSlaves backend
 
 waitTill :: UTCTime -> Process ()
