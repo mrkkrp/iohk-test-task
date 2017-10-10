@@ -6,11 +6,11 @@ http://f.nn.lv/od/5c/8y/CH_OTP_Test_Task(1).pdf
 
 ## Disclaimer
 
-This is the first time I used the `distributed-process`. I understand that
-this claim probably lowers my chances, but I don't want any confusion about
-my degree of proficiency with this framework. I'm quite motivated to learn
-more about `distributed-process`, I mostly figured everything out from
-scratch in last few hours.
+This is the first time I used the `distributed-process` package. I
+understand that this claim probably lowers my chances, but I don't want any
+confusion about my degree of proficiency with this framework. I'm quite
+motivated to learn more about `distributed-process`, and I mostly figured
+everything out from scratch in last few hours.
 
 ## How to build it
 
@@ -83,12 +83,12 @@ Available options:
   -k,--send-for K          For how many seconds the system should send
                            messages (default: 30)
   -l,--wait-for L          Duration (in seconds) of the grace
-                           period (default: 30)
+                           period (default: 10)
   -s,--with-seed S         The seed to use for random number
                            generation (default: 0)
 ```
 
-Note the `--node-list` option which allow to specify a YAML file with node
+Note the `--node-list` option which allows to specify a YAML file with node
 list. See `node-list.yaml` in the repo for an example. By default value of
 `NODELIST` is `"node-list.yaml"`, so this requires you to put a file with
 such name in the directory you're going to run master from. You're free to
