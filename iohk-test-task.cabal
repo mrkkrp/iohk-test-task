@@ -25,12 +25,14 @@ executable iohktt
                     , base
                     , binary
                     , bytestring
+                    , containers
                     , distributed-process
                     , distributed-process-simplelocalnet
                     , lens
                     , network
                     , network-transport
                     , optparse-applicative
+                    , random
                     , tf-random
                     , time
                     , vector

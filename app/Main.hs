@@ -23,6 +23,7 @@ import Data.List (intersect, sortBy)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Monoid
 import Data.Ord (comparing)
+import Data.Set (Set)
 import Data.Time
 import Data.Typeable
 import Data.Yaml hiding (Parser)
@@ -36,6 +37,8 @@ import System.IO (hPutStrLn, stderr)
 import Text.Read (readMaybe)
 import qualified Data.ByteString.Char8 as B8
 import qualified Data.List.NonEmpty    as NE
+import qualified Data.Map.Strict       as M
+import qualified Data.Set              as E
 import qualified System.Random.TF      as TF
 import qualified System.Random.TF.Gen  as TF
 
@@ -66,7 +69,7 @@ instance FromJSON NodeList where
     <$> parseJSON v
 
 data SlaveState = SlaveState
-  { _sstPeers :: [ProcessId]
+  { _sstPeers :: Set ProcessId
     -- ^ A list of peer processes to which to send the messages
   , _sstGracePeriodStart :: UTCTime
     -- ^ Absolute time up to which to send the messages
@@ -122,6 +125,15 @@ data FinishNow = FinishNow
 
 instance Binary FinishNow
 
+data RestartedPeerMsg = RestartedPeerMsg ProcessId ProcessId
+  deriving (Show, Typeable, Generic)
+
+instance Binary RestartedPeerMsg
+
+data SlaveInter
+  = SlaveContinue SlaveState
+  | SlaveFinished
+
 makeLenses 'SlaveState
 makeLenses 'NumberMsg
 
@@ -154,13 +166,22 @@ slave = \case
           say $ "Process " ++ show pid ++ " on node " ++ show nid
             ++ " finished with results: |m|="
             ++ show m ++ ", sigma=" ++ show s
-          return True
-      , match $ \numberMsg -> do
-          slave . Just $ st & sstReceived %~ (numberMsg:)
-          return False ]
+          return SlaveFinished
+        -- NOTE This RestartedPeerMsg thing does not quite work because it
+        -- arrives mostly after start of grace period when we process the
+        -- accumulated messages sent before start of grace period and then
+        -- it can't make any difference. So died node typically finishes
+        -- with |m|=0 in my tests. This could be avoided I guess if time
+        -- between message were longer and they did not accumulate in such
+        -- quantities before RestartedPeerMsg in the message queue.
+      , match $ \(RestartedPeerMsg old new) ->
+          return . SlaveContinue $ st & sstPeers %~ E.insert new . E.delete old
+      , match $ \numberMsg ->
+          return . SlaveContinue $ st & sstReceived %~ (numberMsg:)
+      ]
     case mfinished of
       Nothing ->
-        -- No messages, we can as well send something unless the grace
+        -- NOTE No messages, we can as well send something unless the grace
         -- period has started. By checking against the pre-calculated start
         -- of the grace period we can ensure that once GP starts literally
         -- no message will be sent.
@@ -174,9 +195,9 @@ slave = \case
             newGen <- foldM f (st ^. sstTFGen) (st ^. sstPeers)
             slave . Just $ st & sstTFGen .~ newGen
           else slave (Just st)
-      Just False ->
-        slave (Just st)
-      Just True ->
+      Just (SlaveContinue st') ->
+        slave (Just st')
+      Just SlaveFinished ->
         return ()
 
 remotable ['slave]
@@ -194,44 +215,72 @@ master
 master backend sendFor waitFor seed nids = do
   say "Spawning slave processes"
   say (show nids)
-  pids <- forM nids $ \nid ->
-    spawn nid ($(mkClosure 'slave) (Nothing :: Maybe SlaveState))
+  pidsInitial <- fmap M.fromList . forM nids $ \nid -> do
+    pid <- spawn nid ($(mkClosure 'slave) (Nothing :: Maybe SlaveState))
+    return (pid, nid)
+  pidsRef <- liftIO (newIORef pidsInitial)
   say "Sending initializing messages"
   ctime <- liftIO getCurrentTime
   tfgen <- liftIO (newIORef seed)
   let gracePeriodStart = addUTCTime (fromIntegral sendFor) ctime
       gracePeriodEnd   = addUTCTime (fromIntegral (sendFor + waitFor)) ctime
-      mkSlaveStateFor pid = do
+      mkSlaveStateWith pids = do
         (gen0,gen1) <- TF.split <$> liftIO (readIORef tfgen)
         liftIO (writeIORef tfgen gen0)
         return SlaveState
-          { _sstPeers            = filter (/= pid) pids
+          { _sstPeers            = pids
           , _sstGracePeriodStart = gracePeriodStart
           , _sstReceived         = []
           , _sstTFGen            = gen1 }
-  forM_ pids $ \pid ->
-    mkSlaveStateFor pid >>= send pid . InitializingMsg
-  -- TODO Also restart died processes here.
-  say "Waiting for start of the grace period"
-  waitTill gracePeriodStart
-  -- Need to send this special message now so we know when we have processed
-  -- all messages and do not need to wait for more.
-  forM_ pids $ \pid ->
+  let pidsInitialSet = M.keysSet pidsInitial
+  forM_ pidsInitialSet $ \pid -> do
+    void (monitor pid)
+    mkSlaveStateWith (E.delete pid pidsInitialSet)
+      >>= send pid . InitializingMsg
+  say $ "Waiting for start of the grace period: " ++ show gracePeriodStart
+  fix $ \continue -> do
+    t  <- liftIO getCurrentTime
+    mr <- expectTimeout 0
+    case mr of
+      Nothing ->
+        when (t < gracePeriodEnd) $ do
+          liftIO (threadDelay 100000)
+          continue
+      Just (ProcessMonitorNotification monitorRef pid death) -> do
+        -- NOTE Something went wrong with our node, try to restart it with
+        -- the default state.
+        if isRecoverable death
+          then do
+            say $ "Process " ++ show pid ++ " died, restarting on the same node…"
+            unmonitor monitorRef
+            nid <- (M.! pid) <$> liftIO (readIORef pidsRef)
+            pidsRecent <- M.delete pid <$> liftIO (readIORef pidsRef)
+            pid' <- mkSlaveStateWith (M.keysSet pidsRecent) >>=
+              spawn nid . $(mkClosure 'slave) . Just
+            void (monitor pid')
+            liftIO (writeIORef pidsRef (M.insert pid' nid pidsRecent))
+            forM_ (M.keys pidsRecent) $ \pidi ->
+              send pidi (RestartedPeerMsg pid pid')
+          else do
+            say $ "Process " ++ show pid ++ " died, can't restart it…"
+            liftIO (modifyIORef pidsRef (M.delete pid))
+        continue
+  -- NOTE Need to send this special message now so we know when we have
+  -- processed all messages and do not need to wait for more.
+  pidsFinal <- liftIO (readIORef pidsRef)
+  forM_ (M.keys pidsFinal) $ \pid ->
     send pid FinishNow
-  say "Waiting for end of the grace period"
-  waitTill gracePeriodEnd
+  say $ "Waiting for end of the grace period:   " ++ show gracePeriodEnd
+  fix $ \continue -> do
+    t <- liftIO getCurrentTime
+    when (t < gracePeriodEnd) $ do
+      liftIO (threadDelay 500000)
+      continue
   say "Time is up, killing all slaves"
-  -- Not really necessary but the document says “If result isn't printed
-  -- till now, program is killed”. It's not clear whether slave nodes should
-  -- be killed or just master, but let's kill'em all.
+  -- NOTE Not really necessary but the document says “If result isn't
+  -- printed till now, program is killed”. It's not clear whether slave
+  -- nodes should be killed or just master, but let's kill'em all.
   terminateAllSlaves backend
-
-waitTill :: UTCTime -> Process ()
-waitTill t = fix $ \continue -> do
-  ctime <- liftIO getCurrentTime
-  when (ctime < t) $ do
-    liftIO (threadDelay 500000)
-    continue
 
 ----------------------------------------------------------------------------
 -- Main and parser
@@ -292,7 +341,7 @@ optionParser = subparser
        <*> option parseNatural
        ( long "wait-for"
        <> short 'l'
-       <> value 10
+       <> value 30
        <> metavar "L"
        <> showDefault
        <> help "Duration (in seconds) of the grace period" )
@@ -316,3 +365,9 @@ parseNatural = eitherReader $ \s ->
   case readMaybe s of
     Nothing -> Left "Expected a positive integer."
     Just x  -> Right x
+
+isRecoverable :: DiedReason -> Bool
+isRecoverable = \case
+  DiedNormal      -> True
+  DiedException _ -> True
+  _               -> False
