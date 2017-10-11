@@ -132,6 +132,11 @@ data RestartedPeerMsg = RestartedPeerMsg ProcessId ProcessId
 
 instance Binary RestartedPeerMsg
 
+data PeerDiedMsg = PeerDiedMsg ProcessId
+  deriving (Show, Typeable, Generic)
+
+instance Binary PeerDiedMsg
+
 data SlaveInter
   = SlaveContinue SlaveState
   | SlaveFinished
@@ -176,6 +181,8 @@ slave = \case
           return SlaveFinished
       , match $ \(RestartedPeerMsg old new) ->
           return . SlaveContinue $ st & sstPeers %~ E.insert new . E.delete old
+      , match $ \(PeerDiedMsg pid) ->
+          return . SlaveContinue $ st & sstPeers %~ E.delete pid
       , match $ \numberMsg ->
           return . SlaveContinue $ st & sstReceived %~ (numberMsg:)
       ]
@@ -266,6 +273,9 @@ master backend sendFor waitFor seed nids = do
           else do
             say $ "Process " ++ show pid ++ " died, can't restart it…"
             liftIO (modifyIORef pidsRef (M.delete pid))
+            pidsRecent <- liftIO (readIORef pidsRef)
+            forM_ (M.keys pidsRecent) $ \pidi ->
+              send pidi (PeerDiedMsg pid)
         continue
   -- NOTE Need to send this special message now so we know when we have
   -- processed all messages and do not need to wait for more.
