@@ -143,7 +143,7 @@ Spawning slave processes
 [nid://127.0.0.1:44445:0,nid://127.0.0.1:44446:0,nid://127.0.0.1:44447:0,nid://127.0.0.1:44448:0]
 Sending initializing messages
 Waiting for start of the grace period: 2017-10-10 07:36:56.564039099 UTC
-Waiting for end of the grace period2017-10-10 07:37:26.564039099 UTC
+Waiting for end of the grace period:   2017-10-10 07:37:26.564039099 UTC
 Process pid://127.0.0.1:44447:0:9 on node nid://127.0.0.1:44447:0 finished with results: |m|=95322, sigma=2.2666084150857515e9
 Process pid://127.0.0.1:44446:0:9 on node nid://127.0.0.1:44446:0 finished with results: |m|=93904, sigma=2.200674520589758e9
 Process pid://127.0.0.1:44445:0:9 on node nid://127.0.0.1:44445:0 finished with results: |m|=111903, sigma=3.124078258700147e9
